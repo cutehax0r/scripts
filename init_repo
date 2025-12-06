@@ -1,0 +1,190 @@
+#!/bin/sh
+
+set -e
+
+VERSION="1.0.0"
+
+verbose=false
+dry_run=false
+
+run_cmd() {
+    if [ "$verbose" = true ]; then
+        echo "+ $*"
+    fi
+    if [ "$dry_run" = false ]; then
+        "$@"
+    fi
+}
+
+print_help() {
+    cat <<EOF
+init_repo - initialize a GitHub repository including remote in the current directory
+
+Usage:
+  init_repo [OPTIONS] [DIRECTORY]
+
+Options:
+  --private          Create a private GitHub repository (default)
+  --public           Create a public GitHub repository
+  --name NAME        Specify a different name for the GitHub repository
+  --dry-run          Show what would happen without making changes
+  --verbose          Print commands as they are run
+  --version          Show script version
+  --help             Show this help message
+
+Arguments:
+  DIRECTORY          Directory to initialize repo in (created if doesn't exist)
+                     Defaults to current directory if not specified
+
+Dependencies:
+  - git  (required)
+  - gh   (GitHub CLI, required)
+
+EOF
+}
+
+# Dependency checks
+if ! command -v git >/dev/null 2>&1; then
+    echo "Error: 'git' is not installed or not in PATH." >&2
+    echo "Run 'git_init_repo --help' for details." >&2
+    exit 1
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+    echo "Error: 'gh' (GitHub CLI) is not installed or not in PATH." >&2
+    echo "Run 'git_init_repo --help' for details." >&2
+    exit 1
+fi
+
+# Argument handling
+repo_visibility=""
+repo_name=""
+target_dir=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --private)
+            if [ "$repo_visibility" = "--public" ]; then
+                echo "Error: --public and --private cannot both be specified." >&2
+                exit 1
+            fi
+            repo_visibility="--private"
+            ;;
+        --public)
+            if [ "$repo_visibility" = "--private" ]; then
+                echo "Error: --public and --private cannot both be specified." >&2
+                exit 1
+            fi
+            repo_visibility="--public"
+            ;;
+        --name)
+            # --name consumes the thing right after it. Shift handles quotes for us
+            shift
+            if [ $# -eq 0 ]; then
+                echo "Error: --name requires an argument." >&2
+                exit 1
+            fi
+            repo_name="$1"
+            ;;
+        --dry-run)
+            dry_run=true
+            ;;
+        --verbose)
+            verbose=true
+            ;;
+        --version)
+            echo "$VERSION"
+            exit 0
+            ;;
+        --help)
+            print_help
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            echo "Run 'init_repo --help' for usage." >&2
+            exit 1
+            ;;
+        *)
+            if [ -z "$target_dir" ]; then
+                target_dir="$1"
+            else
+                echo "Error: multiple positional arguments provided." >&2
+                echo "Run 'init_repo --help' for usage." >&2
+                exit 1
+            fi
+            ;;
+    esac
+    shift
+done
+
+# Default visibility is private - it's safer than public
+if [ -z "$repo_visibility" ]; then
+    repo_visibility="--private"
+fi
+
+# Handle target directory if specified
+if [ -n "$target_dir" ]; then
+    if [ ! -d "$target_dir" ]; then
+        run_cmd mkdir -p "$target_dir"
+    fi
+    run_cmd cd "$target_dir"
+fi
+
+# Determine repo name: --name takes priority, then target_dir, then current directory
+if [ -z "$repo_name" ]; then
+    if [ -n "$target_dir" ]; then
+        repo_name=$(basename "$target_dir")
+    else
+        repo_name=$(basename "$PWD")
+    fi
+fi
+
+if [ "$verbose" = true ]; then
+    echo "Repository name: $repo_name"
+    echo "Visibility: ${repo_visibility#--}"
+    if [ -n "$target_dir" ]; then
+        echo "Target directory: $target_dir"
+    fi
+fi
+
+# If we're not in a git repo already then make it one
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    run_cmd git init
+    # Make an initial commit so we have a branch to work with
+    run_cmd git add .
+    run_cmd git commit --allow-empty -m "Initial commit"
+fi
+
+# Don't do a redundant origin
+if git remote | grep -q "^origin\$"; then
+    echo "Error: A remote named 'origin' already exists. Aborting." >&2
+    exit 1
+fi
+
+# Main is better because shorter but maybe I'm pushing old stuff that was master
+if git show-ref --verify --quiet refs/heads/main >/dev/null 2>&1; then
+    primary_branch="main"
+elif git show-ref --verify --quiet refs/heads/master >/dev/null 2>&1; then
+    primary_branch="master"
+else
+    primary_branch="main"
+    run_cmd git checkout -b main
+fi
+
+run_cmd git checkout "$primary_branch"
+
+# Create the remote repo on github. Maybe get support for gitlab too?
+run_cmd gh repo create "$repo_name" \
+    $repo_visibility \
+    --source=. \
+    --remote=origin \
+    --push
+
+# Push manually: separate step just in case remote setup was already done
+run_cmd git push -u origin "$primary_branch"
+
+if [ "$dry_run" = true ]; then
+    echo "(dry-run) No changes were actually made."
+fi
+

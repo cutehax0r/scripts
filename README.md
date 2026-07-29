@@ -19,3 +19,13 @@ be a helpful thing to reference.
   3. The current directory's basename if neither above is specified
 
   You can specify `--public` to make it a public repository; otherwise `--private` is the default.
+
+## init_ruby
+
+* Installs a specific Ruby version via `ruby-build` and then installs a set of standard
+  gems. Requires `ruby-build` and `chruby` to be installed.
+
+  Usage: `init_ruby <version>`
+
+  Example: `init_ruby 4.0.0` installs Ruby 4.0.0 to `~/.local/share/ruby/4.0.0`
+  and installs common gems (rake, pry, sorbet, minitest, rspec, rubocop, rails, etc.).

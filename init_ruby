@@ -1,0 +1,164 @@
+#!/bin/sh
+
+set -e
+
+VERSION="1.0.0"
+
+verbose=false
+dry_run=false
+
+run_cmd() {
+    if [ "$verbose" = true ]; then
+        echo "+ $*"
+    fi
+    if [ "$dry_run" = false ]; then
+        "$@"
+    fi
+}
+
+print_help() {
+    cat <<EOF
+init_ruby - install a specific Ruby version and standard gems
+
+Usage:
+  init_ruby [OPTIONS] <VERSION>
+
+Options:
+  --verbose          Print commands as they are run
+  --dry-run          Show what would happen without making changes
+  --version          Show script version
+  --help             Show this help message
+
+Arguments:
+  VERSION            Ruby version to install (e.g., 3.4.6, 4.0.0)
+
+Dependencies:
+  - ruby-build  (required)
+  - chruby      (required)
+
+EOF
+}
+
+# Dependency checks
+if ! command -v ruby-build >/dev/null 2>&1; then
+    echo "Error: 'ruby-build' is not installed or not in PATH." >&2
+    echo "Run 'init_ruby --help' for details." >&2
+    exit 1
+fi
+
+# Source chruby so we can check for it (it's a shell function)
+# shellcheck source=/dev/null
+if [ -f /opt/homebrew/opt/chruby/share/chruby/chruby.sh ]; then
+    . /opt/homebrew/opt/chruby/share/chruby/chruby.sh
+elif [ -f /usr/local/share/chruby/chruby.sh ]; then
+    . /usr/local/share/chruby/chruby.sh
+elif [ -f /usr/share/chruby/chruby.sh ]; then
+    . /usr/share/chruby/chruby.sh
+fi
+
+if ! command -v chruby >/dev/null 2>&1; then
+    echo "Error: 'chruby' is not installed or not in PATH." >&2
+    echo "Run 'init_ruby --help' for details." >&2
+    exit 1
+fi
+
+# Argument handling
+version=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --verbose)
+            verbose=true
+            ;;
+        --dry-run)
+            dry_run=true
+            ;;
+        --version)
+            echo "$VERSION"
+            exit 0
+            ;;
+        --help)
+            print_help
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            echo "Run 'init_ruby --help' for usage." >&2
+            exit 1
+            ;;
+        *)
+            if [ -z "$version" ]; then
+                version="$1"
+            else
+                echo "Error: multiple positional arguments provided." >&2
+                echo "Run 'init_ruby --help' for usage." >&2
+                exit 1
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [ -z "$version" ]; then
+    echo "Error: VERSION argument is required." >&2
+    echo "Run 'init_ruby --help' for usage." >&2
+    exit 1
+fi
+
+install_dir="$HOME/.local/share/ruby/$version"
+
+if [ "$verbose" = true ]; then
+    echo "Ruby version: $version"
+    echo "Install directory: $install_dir"
+fi
+
+# Check if already installed
+if [ -d "$install_dir" ]; then
+    echo "Ruby $version already installed at $install_dir. Skipping."
+    echo
+    echo "To reinstall, remove the directory first:"
+    echo "  rm -rf $install_dir"
+    echo "  init_ruby $version"
+    exit 0
+fi
+
+# Install Ruby via ruby-build
+run_cmd ruby-build "$version" "$install_dir"
+
+# Update RUBIES to include all installed versions
+rubies=""
+for d in "$HOME/.local/share/ruby"/*/; do
+    if [ -d "$d" ]; then
+        rubies="$rubies${rubies:+ }${d%/}"
+    fi
+done
+export RUBIES="$rubies"
+
+# Activate the new Ruby for the gem install step
+PATH="$install_dir/bin:$PATH"
+export PATH
+
+# Install standard gems
+run_cmd gem install \
+    rake \
+    pry \
+    sorbet \
+    minitest \
+    rspec \
+    rubocop-sorbet \
+    rubocop \
+    rails \
+    mocha \
+    factory_bot \
+    neovim \
+    solargraph \
+    tapioca \
+    byebug \
+    yard \
+    ruby-lsp
+
+echo "Ruby $version installed successfully with standard gems at $install_dir"
+
+if [ "$dry_run" = true ]; then
+    echo "(dry-run) No changes were actually made."
+fi

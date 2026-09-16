@@ -1,0 +1,261 @@
+#!/bin/sh
+
+set -e
+
+VERSION="1.0.0"
+
+# If the loudest channel beats the runner-up by more than this many dB, we
+# treat the runner-up as noise/silence (e.g. an unplugged mic input) rather
+# than real stereo content, and just extract the loudest channel.
+DOMINANT_CHANNEL_THRESHOLD_DB=20
+
+verbose=false
+dry_run=false
+
+run_cmd() {
+    if [ "$verbose" = true ]; then
+        echo "+ $*"
+    fi
+    if [ "$dry_run" = false ]; then
+        "$@"
+    fi
+}
+
+print_help() {
+    cat <<EOF
+demono - convert a file's audio to mono, doing the right thing automatically
+
+If one channel is clearly silent or just noise (e.g. you recorded with a
+single microphone plugged into one input of an audio interface), that
+channel is dropped and the other is used as-is. Otherwise a standard
+stereo/multichannel downmix is performed.
+
+Usage:
+  demono [OPTIONS] INPUT OUTPUT
+
+Options:
+  --channel N        Force extraction of channel N (0-based) instead of
+                      auto-detecting which channel has the real audio
+  --force            Overwrite OUTPUT if it already exists
+  --dry-run          Show what would happen without making changes
+  --verbose          Print commands as they are run
+  --version          Show script version
+  --help             Show this help message
+
+Arguments:
+  INPUT              Input audio/video file
+  OUTPUT             File to write the converted result to
+
+Dependencies:
+  - ffmpeg   (required)
+  - ffprobe  (required, ships with ffmpeg)
+
+EOF
+}
+
+# Dependency checks
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "Error: 'ffmpeg' is not installed or not in PATH." >&2
+    echo "Run 'demono --help' for details." >&2
+    exit 1
+fi
+
+if ! command -v ffprobe >/dev/null 2>&1; then
+    echo "Error: 'ffprobe' is not installed or not in PATH." >&2
+    echo "Run 'demono --help' for details." >&2
+    exit 1
+fi
+
+# Argument handling
+force=false
+forced_channel=""
+input_file=""
+output_file=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --channel)
+            shift
+            if [ $# -eq 0 ]; then
+                echo "Error: --channel requires an argument." >&2
+                exit 1
+            fi
+            forced_channel="$1"
+            ;;
+        --force)
+            force=true
+            ;;
+        --dry-run)
+            dry_run=true
+            ;;
+        --verbose)
+            verbose=true
+            ;;
+        --version)
+            echo "$VERSION"
+            exit 0
+            ;;
+        --help)
+            print_help
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            echo "Run 'demono --help' for usage." >&2
+            exit 1
+            ;;
+        *)
+            if [ -z "$input_file" ]; then
+                input_file="$1"
+            elif [ -z "$output_file" ]; then
+                output_file="$1"
+            else
+                echo "Error: multiple positional arguments provided." >&2
+                echo "Run 'demono --help' for usage." >&2
+                exit 1
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [ -z "$input_file" ] || [ -z "$output_file" ]; then
+    echo "Error: INPUT and OUTPUT arguments are required." >&2
+    echo "Run 'demono --help' for usage." >&2
+    exit 1
+fi
+
+if [ ! -f "$input_file" ]; then
+    echo "Error: input file '$input_file' does not exist." >&2
+    exit 1
+fi
+
+if [ -e "$output_file" ] && [ "$force" = false ]; then
+    echo "Error: output file '$output_file' already exists. Use --force to overwrite." >&2
+    exit 1
+fi
+
+# Figure out how many channels the first audio stream has
+channels=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$input_file" 2>/dev/null || true)
+
+if [ -z "$channels" ]; then
+    echo "Error: no audio stream found in '$input_file'." >&2
+    exit 1
+fi
+
+if [ -n "$forced_channel" ]; then
+    if [ "$forced_channel" -ge "$channels" ] 2>/dev/null; then
+        echo "Error: --channel $forced_channel is out of range (input has $channels channel(s))." >&2
+        exit 1
+    fi
+fi
+
+# Does the input have a video stream? If so we keep it untouched.
+video_present=false
+if ffprobe -v error -select_streams v:0 -show_entries stream=index -of csv=p=0 "$input_file" 2>/dev/null | grep -q .; then
+    video_present=true
+fi
+
+get_mean_volume() {
+    channel_index="$1"
+    volume=$(ffmpeg -hide_banner -nostats -i "$input_file" \
+        -af "pan=mono|c0=c${channel_index},volumedetect" -f null - 2>&1 \
+        | grep mean_volume | awk -F'mean_volume: ' '{print $2}' | awk '{print $1}' | tail -1)
+    if [ -z "$volume" ]; then
+        # Total silence reports as -inf, which awk can't compare directly
+        volume="-999"
+    fi
+    echo "$volume"
+}
+
+audio_filter=""
+extra_args=""
+
+if [ -n "$forced_channel" ]; then
+    if [ "$verbose" = true ]; then
+        echo "Forcing extraction of channel $forced_channel."
+    fi
+    audio_filter="pan=mono|c0=c${forced_channel}"
+elif [ "$channels" -eq 1 ]; then
+    if [ "$verbose" = true ]; then
+        echo "Audio is already mono; passing it through unchanged."
+    fi
+else
+    if [ "$verbose" = true ]; then
+        echo "Analyzing $channels audio channels to find the real signal..."
+    fi
+
+    volumes=""
+    i=0
+    while [ "$i" -lt "$channels" ]; do
+        vol=$(get_mean_volume "$i")
+        if [ "$verbose" = true ]; then
+            echo "  channel $i: mean volume ${vol} dB"
+        fi
+        volumes="${volumes}${i} ${vol}
+"
+        i=$((i + 1))
+    done
+
+    result=$(printf '%s' "$volumes" | awk '
+        NF {
+            if ($2 > max1 || idx1 == "") { max2 = max1; idx2 = idx1; max1 = $2; idx1 = $1 }
+            else if ($2 > max2 || idx2 == "") { max2 = $2; idx2 = $1 }
+        }
+        END { print idx1, max1, idx2, max2 }
+    ')
+    loud_idx=$(echo "$result" | cut -d' ' -f1)
+    loud_vol=$(echo "$result" | cut -d' ' -f2)
+    next_vol=$(echo "$result" | cut -d' ' -f4)
+
+    dominant=$(awk -v a="$loud_vol" -v b="$next_vol" -v t="$DOMINANT_CHANNEL_THRESHOLD_DB" \
+        'BEGIN { print (a - b > t) ? "1" : "0" }')
+
+    if [ "$dominant" = "1" ]; then
+        if [ "$verbose" = true ]; then
+            echo "Channel $loud_idx is clearly the real signal; the rest look like silence/noise. Extracting it."
+        fi
+        audio_filter="pan=mono|c0=c${loud_idx}"
+    else
+        if [ "$verbose" = true ]; then
+            echo "Multiple channels carry real audio; performing a standard downmix to mono."
+        fi
+        extra_args="-ac 1"
+    fi
+fi
+
+# Build the map/codec args
+map_args="-map 0:a:0"
+if [ "$video_present" = true ]; then
+    map_args="-map 0:v:0 $map_args"
+fi
+
+if [ "$channels" -eq 1 ] && [ -z "$forced_channel" ]; then
+    if [ "$video_present" = true ]; then
+        run_cmd ffmpeg -i "$input_file" -map 0:v:0 -map 0:a:0 -c:v copy -c:a copy "$output_file"
+    else
+        run_cmd ffmpeg -i "$input_file" -map 0:a:0 -c:a copy "$output_file"
+    fi
+    echo "Done. '$output_file' has the same mono audio as the source."
+    exit 0
+fi
+
+if [ -n "$audio_filter" ]; then
+    if [ "$video_present" = true ]; then
+        run_cmd ffmpeg -i "$input_file" -map 0:v:0 -map 0:a:0 -c:v copy -af "$audio_filter" -c:a aac -b:a 192k "$output_file"
+    else
+        run_cmd ffmpeg -i "$input_file" -map 0:a:0 -af "$audio_filter" -c:a aac -b:a 192k "$output_file"
+    fi
+else
+    if [ "$video_present" = true ]; then
+        run_cmd ffmpeg -i "$input_file" -map 0:v:0 -map 0:a:0 -c:v copy -ac 1 -c:a aac -b:a 192k "$output_file"
+    else
+        run_cmd ffmpeg -i "$input_file" -map 0:a:0 -ac 1 -c:a aac -b:a 192k "$output_file"
+    fi
+fi
+
+echo "Done. Mono audio written to '$output_file'."
+
+if [ "$dry_run" = true ]; then
+    echo "(dry-run) No changes were actually made."
+fi
